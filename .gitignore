@@ -1,0 +1,10 @@
+*.mp4
+/videos
+
+# do not add API keys
+.env
+
+__pycache__
+
+*.zip
+.vscode
