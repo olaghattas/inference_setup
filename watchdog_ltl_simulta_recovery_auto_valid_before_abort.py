@@ -86,12 +86,19 @@ def decide_recovery(
         return (RecoveryAction.ABORT, None)
 
     if inferred_mode:
-        
-        return (RecoveryAction.RECOVER_TO_MODE, inferred_mode)
-    else: ## not in keypoints so go to reset location
-        return (RecoveryAction.RECOVER_GET_STATE, "reset_position")
-        
+        print(f"inferred_mode {inferred_mode}")
+        for mode, kp in keypoint_store.keypoints.items():
+            print(f"[decide_recovery] [{mode}] {kp}")
     
+        if keypoint_store.has(inferred_mode):
+            print(f"inferred_mode in keypoints ")
+            return (RecoveryAction.RECOVER_TO_MODE, inferred_mode)
+        else: ## not in keypoints so go to reset location
+            return (RecoveryAction.RECOVER_TO_MODE, "reset_position")
+        
+    else:
+        # No valid state from current predicates → go to reset, get state there, set mode and continue
+        return (RecoveryAction.RECOVER_GET_STATE, "reset_position")
  
     
     # # Case 1: predicates correspond to a valid mode
@@ -713,20 +720,20 @@ def data_receiver_thread(port=5540):
             if 'event' in message and message['event'] == 'robot_reset':
                 ts = message.get("timestep", "N/A")
                 print(f"!!! ROBOT RESET DETECTED at T={ts} !!!")
-                print(">>> Wiping History Buffer ...") #and Initial Step...")
+                print(">>> Wiping History Buffer and Initial Step...")
                 with buffer_lock:
                     shared_buffer.clear()
-                # with initial_step_lock:
-                #     initial_step = None
-                #     pending_initial_snapshot = None
+                with initial_step_lock:
+                    initial_step = None
+                    pending_initial_snapshot = None
                 continue
             if 'event' in message and message['event'] == 'robot_continue':
-                print(">>> Wiping History Buffer ...") #and Initial Step...")
+                print(">>> Wiping History Buffer and Initial Step...")
                 with buffer_lock:
                     shared_buffer.clear()
-                # with initial_step_lock:
-                #     initial_step = None
-                #     pending_initial_snapshot = None
+                with initial_step_lock:
+                    initial_step = None
+                    pending_initial_snapshot = None
                 stopped = False
                 continue
             
@@ -864,7 +871,7 @@ def call_gemini_worker(client, model_id, payload, config, step_id, grasped_state
             "error": str(e)
         }
 
-def trigger_perception_standalone(perception_retry=False, use_initial_only=False, valid_states=None, infer_mode=False):
+def trigger_perception_standalone(perception_retry=False, use_initial_only=False, valid_states=None):
     """
     Run perception once.
     - perception_retry=True: pass prior belief, re-evaluate grasped(...) from current image only.
@@ -968,18 +975,7 @@ def trigger_perception_standalone(perception_retry=False, use_initial_only=False
         # update the predicates
         ltl_monitor.predicates = pred_vector
         # run a step
-        if not infer_mode:
-            status_monitor = ltl_monitor.monitor_step()
-            status = status_monitor.status
-        else:
-            inferred_mode = ltl_monitor.infer_mode_from_predicates(pred_vector)
-            if inferred_mode is not None:
-                status = "running"
-                ## set it
-                ltl_monitor.curr_mode = inferred_mode
-            else:
-                status = "violation"
-            
+        status = ltl_monitor.monitor_step()
         print("LTL Monitor Status: ", status)
         if status == "violation":
             print("!!! LTL VIOLATION — SENDING STOP TO ROBOT !!!")
@@ -1007,7 +1003,7 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
     keys = [
         os.environ.get("GEMINI_API_KEY_HASSAN"),
         os.environ.get("GEMINI_API_KEY_NOUR"),
-        os.environ.get("GEMINI_API_KEY_LEEN"),
+        os.environ.get("GEMINI_API_KEY_LYNN"),
         os.environ.get("GEMINI_API_KEY"),
         os.environ.get("GEMINI_API_KEY_GMAIL"),
     ]
@@ -1215,8 +1211,8 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                             pending_tasks.clear()
                             
                             # Gripper closed but no grasped predicate true: either failed grasp or inference delay (grasped often true only after lift)
+                            print("any grasped predicate true:", any(pred_vector[i] == 1 for i in grasped_indices))
                             if r_grasped and not any(pred_vector[i] == 1 for i in grasped_indices):
-                                print("any grasped predicate true:", any(pred_vector[i] == 1 for i in grasped_indices))
                                 print(f"r_grasped={r_grasped} but no grasped pred true — delay or failed grasp")
                                 if grasp_recovery:
                                     print("Second time: treat as real violation (robot likely failed to grasp)")
@@ -1241,47 +1237,28 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                             stop_payload = {"command": "STOP", "reason": "LTL violation"}
                             cmd_pub_socket.send_pyobj(stop_payload)
                             stopped = True
-
-                            # Recovery loop: keep deciding and executing until we continue or abort.
-                            # After RETRY_PERCEPTION we re-infer from updated predicates and re-decide (e.g. RECOVER_TO_MODE(ag)).
-                            current_mode_for_recovery = result.curr_mode
-                            recovery_done = False
-                            while not recovery_done:
-                                inferred_mode = ltl_monitor.infer_mode_from_predicates(ltl_monitor.predicates)
-                                print(f"[recovery] inferred_mode={inferred_mode} current_mode={current_mode_for_recovery}")
-                                action, target = decide_recovery(
-                                    inferred_mode=inferred_mode,
-                                    current_mode=current_mode_for_recovery,
-                                    retry_count=violation_retry_count,
-                                    keypoint_store=keypoints,
-                                    last_recovery=last_recovery
-                                )
-                                violation_retry_count += 1
-                                print(f"[recovery] action={action} target={target}")
-
-                                if action == RecoveryAction.RECOVER_TO_MODE:
-                                    set_exec_visual_state(ExecVisualState.RECOVERING)
                             
-                                    ## for the vlm to infer it the robot should be in that mdoe so no need to move just set it.
-                                    print(f"target: {target}")
-                                    ltl_monitor.curr_mode = target
-                                    wait_for_next_step("Recovering to mode — send CONTINUE?")
-                                    print("CONTINUE...")
-                                    cmd_pub_socket.send_pyobj({"command": "CONTINUE"})
-                                    grasp_recovery = 0
-                                    stopped = False
-                                    violation_retry_count = 0
-                                    last_recovery = None
-                                    recovery_done = True
+                            print(f"inferring_mode")
+                            inferred_mode = ltl_monitor.infer_mode_from_predicates(pred_vector)
+                            
+                            action, target = decide_recovery(
+                                inferred_mode=inferred_mode,
+                                current_mode=result.curr_mode,
+                                retry_count=violation_retry_count,
+                                keypoint_store=keypoints,
+                                last_recovery=last_recovery
+                            )
 
-                                elif action == RecoveryAction.RECOVER_GET_STATE:
-                                    set_exec_visual_state(ExecVisualState.RECOVERING)
+                            violation_retry_count += 1
+                            
+                            if action == RecoveryAction.RECOVER_TO_MODE:
+                                set_exec_visual_state(ExecVisualState.RECOVERING)
+                                if target == "reset_position":
                                     print(f"Recovering to mode with reset position")
                                     cmd_pub_socket.send_pyobj({"command": "RESET_POSE"})
                                     wait_for_next_step("Recovering to reset pose — run perception?")
                                     print("RUNNING PERCEPTION")
-                                    # to set the mode in the perception
-                                    new_stat = trigger_perception_standalone(infer_mode=True)
+                                    new_stat = trigger_perception_standalone()
                                     print(f"new_stat: {new_stat}")
                                     if new_stat.status == "running":
                                         print("new_stat: running")
@@ -1294,39 +1271,97 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                                         stopped = False
                                         violation_retry_count = 0
                                         last_recovery = None
-                                        recovery_done = True
-                                            
-                                    else :
-                                        print("!!! No state satisfied after last-chance recovery — ABORT (task cannot be done) !!!")
-                                        set_exec_visual_state(ExecVisualState.VIOLATION)
-                                        cmd_pub_socket.send_pyobj({
-                                            "command": "ABORT",
-                                            "reason": "No valid state after recovery; task cannot be completed",
-                                        })
-                                        stopped = True
-                                        last_recovery = action
-                                        recovery_done = True
-                                    
-                                elif action == RecoveryAction.RETRY_PERCEPTION:
-                                    set_exec_visual_state(ExecVisualState.RECOVERING)
-                                    print("Retrying perception (re-evaluating grasp from image, persisting other predicates)")
-                                    new_stat = trigger_perception_standalone(perception_retry=True)
-                                    print(f"new_stat: {new_stat}")
-                                    if new_stat.status == "running":
-                                        print(f"new_stat: running")
-                                        grasp_recovery = 0
-                                        stopped = False
-                                        cmd_pub_socket.send_pyobj({"command": "CONTINUE"})
-                                        set_exec_visual_state(ExecVisualState.CONTINUING)
-                                        violation_retry_count = 0
-                                        last_recovery = None
-                                        recovery_done = True
                                     else:
                                         last_recovery = action
-                                        current_mode_for_recovery = ltl_monitor.curr_mode
-                                        # Loop again: re-infer from updated predicates and re-decide (e.g. RECOVER_TO_MODE(ag))
+                                        
+                                else:
+                                    print(f"Recovering to mode {target}")
+                                    kp = keypoints.get(target)
+                                    
+                                    print(f"kp: {kp}")
+                                    cmd_pub_socket.send_pyobj({
+                                        "command": "GOTO_POSE",
+                                        "joint_angles": kp.pose.tolist()
+                                    })
+                                    
+                                    
+                                    # sleep first
+                                    
+                                    ### update mode to new keypoint
+                                    print(f"target: {target}")
+                                    ltl_monitor.curr_mode = target
+                                    
+                                    wait_for_next_step("Recovering to mode — send CONTINUE?")
+                                    print("CONTINUE...")
+                                    cmd_pub_socket.send_pyobj({"command": "CONTINUE"})
+                                    grasp_recovery = 0
+                                    stopped = False
+                                    violation_retry_count = 0
+                                    last_recovery = None
 
-                                elif action == RecoveryAction.ABORT:
+                            elif action == RecoveryAction.RECOVER_GET_STATE:
+                                set_exec_visual_state(ExecVisualState.RECOVERING)
+                                cmd_pub_socket.send_pyobj({"command": "RESET_POSE"})
+                                new_stat = trigger_perception_standalone()
+                                inferred_after_reset = ltl_monitor.infer_mode_from_predicates(ltl_monitor.predicates)
+                                if inferred_after_reset is None:
+                                    # Last chance: one more perception with valid-states context before abort
+                                    valid_states = list(ltl_monitor.automaton_dict.keys())
+                                    print("No state satisfied after reset — last chance perception with valid states:", valid_states)
+                                    trigger_perception_standalone(valid_states=valid_states)
+                                    inferred_after_reset = ltl_monitor.infer_mode_from_predicates(ltl_monitor.predicates)
+                                if inferred_after_reset is None:
+                                    print("!!! No state satisfied after last-chance recovery — ABORT (task cannot be done) !!!")
+                                    set_exec_visual_state(ExecVisualState.VIOLATION)
+                                    cmd_pub_socket.send_pyobj({
+                                        "command": "ABORT",
+                                        "reason": "No valid state after recovery; task cannot be completed",
+                                    })
+                                    stopped = True
+                                    last_recovery = action
+                                else:
+                                    ltl_monitor.curr_mode = inferred_after_reset
+                                    print("Mode set to", ltl_monitor.curr_mode, "— continuing from recovered state")
+                                    grasp_recovery = 0
+                                    stopped = False
+                                    cmd_pub_socket.send_pyobj({"command": "CONTINUE"})
+                                    set_exec_visual_state(ExecVisualState.CONTINUING)
+                                    violation_retry_count = 0
+                                    last_recovery = None
+
+                            elif action == RecoveryAction.RETRY_PERCEPTION:
+                                set_exec_visual_state(ExecVisualState.RECOVERING)
+                                print("Retrying perception (re-evaluating grasp from image, persisting other predicates)")
+                                new_stat = trigger_perception_standalone(perception_retry=True)
+                                print(f"new_stat: {new_stat}")
+                                if new_stat.status == "running":
+                                    print(f"new_stat: running")
+                                    grasp_recovery = 0
+                                    stopped = False 
+                                    cmd_pub_socket.send_pyobj({"command": "CONTINUE"})
+                                    set_exec_visual_state(ExecVisualState.CONTINUING)
+                                    print("publishing contniue")
+                                    violation_retry_count = 0
+                                    last_recovery = None
+                                    
+                                last_recovery = action
+
+                            elif action == RecoveryAction.ABORT:
+                                # Last chance: one more perception with valid-states context before abort
+                                valid_states = list(ltl_monitor.automaton_dict.keys())
+                                print("Recovery exhausted — last chance perception with valid states:", valid_states)
+                                trigger_perception_standalone(valid_states=valid_states)
+                                inferred_last = ltl_monitor.infer_mode_from_predicates(ltl_monitor.predicates)
+                                if inferred_last is not None:
+                                    ltl_monitor.curr_mode = inferred_last
+                                    print("Last-chance recovery: mode set to", ltl_monitor.curr_mode, "— continuing")
+                                    grasp_recovery = 0
+                                    stopped = False
+                                    cmd_pub_socket.send_pyobj({"command": "CONTINUE"})
+                                    set_exec_visual_state(ExecVisualState.CONTINUING)
+                                    violation_retry_count = 0
+                                    last_recovery = None
+                                else:
                                     print("!!! ABORT: still no state after last chance — task cannot be completed !!!")
                                     set_exec_visual_state(ExecVisualState.VIOLATION)
                                     cmd_pub_socket.send_pyobj({
@@ -1334,7 +1369,6 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                                         "reason": "Recovery exhausted; no valid state (task cannot be completed)",
                                     })
                                     stopped = True
-                                    recovery_done = True
                                     break
 
                         ## update keypoint after a successful transition
@@ -1596,11 +1630,9 @@ if __name__ == "__main__":
     global client, GEMINI_API_KEY, MODEL_ID
     # api_keys_available = ["GEMINI_API_KEY", "GEMINI_API_KEY_LEEN", "GEMINI_API_KEY_NOUR", "GEMINI_API_KEY_HASSAN"]
 
-    # # MODEL_ID = "gemini-2.0-flash"
-    # Gemini Robotics ER 1.5 Preview : gemini-robotics-er-1.5-preview
     MODEL_ID = "gemini-2.5-flash"
-    GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-    api_keys_used.append("GEMINI_API_KEY")
+    GEMINI_API_KEY = os.environ["GEMINI_API_KEY_NOUR"]
+    # api_keys_used.append("GEMINI_API_KEY")
     # api_keys_used.append("GEMINI_API_KEY_HASSAN")
     # api_keys_used.append("GEMINI_API_KEY_NOUR") ## already done
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -1612,8 +1644,6 @@ if __name__ == "__main__":
     # IMPORTANT: bind here, robot connects
     cmd_pub_socket.bind("tcp://*:5546")
 
-    # Gemini Robotics ER 1.5 Preview
-    
     # Give ZMQ time to establish the connection
     time.sleep(0.5)
     
