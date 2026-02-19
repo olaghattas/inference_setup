@@ -30,8 +30,8 @@ COLOR_RESET = "\033[0m"
 class LTLMonitor:
     def __init__(self):
 
-        filename = "/home/olagh48652/task_monitor/task_pot/prog_offline_pot_task.txt"     ## new final 
-        # filename = "/home/olagh48652/task_monitor/test_rules/prog_offline_pot_task_rules_full.txt" ## rules
+        # filename = "/home/olagh48652/task_monitor/task_pot/prog_offline_pot_task.txt"     ## new final 
+        filename = "/home/olagh48652/task_monitor/test_rules/prog_offline_pot_task_rules_full.txt" ## rules
         formula = self.load_formula_from_file(filename)
         # print(formula)
         self.formula = formula
