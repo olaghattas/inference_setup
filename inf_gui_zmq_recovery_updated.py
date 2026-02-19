@@ -210,6 +210,7 @@ class DiffusionPolicyInference():
         # checkpoint = "/home/franka_deoxys/ola_inference/epoch_1400_20260206_211419_train_loss_0.0018.ckpt"
         # checkpoint = "/home/franka_deoxys/ola_inference/epoch_1600_20260207_132921_train_loss_0.0021.ckpt"
         checkpoint = "/home/franka_deoxys/ola_inference/epoch_1700_20260207_213806_train_loss_0.0025.ckpt"
+        # checkpoint = "/home/franka_deoxys/ola_inference/rack_task/epoch_900_20260209_183252.ckpt"
 
         payload = torch.load(open(checkpoint, 'rb'), pickle_module=dill)
         cfg = payload['cfg']
@@ -479,7 +480,21 @@ class DiffusionPolicyInference():
             self.in_recovery = True
             self.move_joints(joints)
         
+        elif cmd == "SNAPSHOT":
+            print("Supervisor SNAPSHOT received")
+            self.obs_dict=self.get_current_obs()
+            # 2. Send current state to Monitor (Fire and Forget)
+            self.watchdog.send_state(self.obs_dict)
 
+            payload = {
+                'event': 'snapshot_sent',
+                'timestamp': time.time()
+            }
+
+            # Send immediately (Fire and Forget)
+            self.watchdog.pub_socket.send_pyobj(payload)
+            
+       
         elif cmd == "CONTINUE":
             print("Supervisor CONTINUE received")
             if self.in_recovery:
