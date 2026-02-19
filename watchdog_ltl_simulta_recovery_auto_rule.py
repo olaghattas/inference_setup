@@ -20,6 +20,7 @@ from typing import Dict, Optional
 
 from enum import Enum
 
+from rule_enforcer import LogicEnforcer
 
 class ExecVisualState(Enum):
     RUNNING = "RUNNING"
@@ -79,7 +80,7 @@ def decide_recovery(
     last_recovery,
 ):  
     # last_recovery should be wiped every time the policy is run 
-    if retry_count < 2:
+    if retry_count < 1:
         return (RecoveryAction.RETRY_PERCEPTION, None)
     
     # Recovery already tried get-state-at-reset and we're still in violation → abort (no state satisfied)
@@ -327,16 +328,13 @@ def is_retryable(e) -> bool:
         return False  # do not retry for other errors
     
 def generate_with_retry(model_id, contents, gen_config):
-    """Call Gemini API with retries. Prints wall-clock time from call until return."""
+    ## to reflect switched key
+    
     @retry.Retry(predicate=is_retryable, initial=10, multiplier=1.5, deadline=300)
     def inner():
         global client
         return client.models.generate_content(model=model_id, contents=contents, config=gen_config)
-    t0 = time.perf_counter()
-    out = inner()
-    elapsed = time.perf_counter() - t0
-    print(f"[API] generate_content returned in {elapsed:.2f}s")
-    return out
+    return inner()
 
 # ------------------------------------------------------------
 # Building prompts 
@@ -550,17 +548,6 @@ def cv2_to_pil(cv_img):
     return Image.fromarray(rgb_img)
 
 
-def save_inference_images(step_id, front_img, wrist_img, folder):
-    """Save front and wrist images used for inference next to the predicate JSON (same step_id)."""
-    try:
-        if front_img is not None and hasattr(front_img, "save"):
-            front_img.save(os.path.join(folder, f"{step_id}_front.jpg"), "JPEG", quality=92)
-        if wrist_img is not None and hasattr(wrist_img, "save"):
-            wrist_img.save(os.path.join(folder, f"{step_id}_wrist.jpg"), "JPEG", quality=92)
-    except Exception as e:
-        print(f"[save_inference_images] Error saving step {step_id}: {e}")
-
-
 def copy_step_for_initial(step_data):
     """Deep copy one timestep (including PIL images) for storing as initial_step reference."""
     out = {
@@ -744,6 +731,10 @@ def data_receiver_thread(port=5540):
                 stopped = False
                 continue
             
+            if 'event' in message and message['event'] == 'snapshot_sent':
+                print("*** RECIEVED SNAPSHOT ")
+                continue
+            
             # 2. Process Images (Decode from Bytes)
             img0_pil, img1_pil = None, None
             
@@ -847,15 +838,12 @@ from concurrent.futures import ThreadPoolExecutor
 # This runs in the background. We pass 'grasped_state' in so it travels with the request.
 def call_gemini_worker(client, model_id, payload, config, step_id, grasped_state, pose):
     try:
-        t0 = time.perf_counter()
         response = client.models.generate_content(
             model=model_id,
             contents=payload,
             config=config
         )
-        elapsed = time.perf_counter() - t0
-        print(f"[API] Step {step_id} generate_content returned in {elapsed:.2f}s")
-
+        
         # Parse JSON here to offload work from main thread
         text_response = response.text
         try:
@@ -968,8 +956,8 @@ def trigger_perception_standalone(perception_retry=False, use_initial_only=False
         output_file = os.path.join(OUTPUT_FOLDER, f"{step_counter}_true_predicates.json")
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(json_output, f, indent=4)
-        save_inference_images(step_counter, last_step.get("front_img"), last_step.get("wrist_img"), OUTPUT_FOLDER)
-        step_counter += 1
+            
+        step_counter += 1  
         print("Successfully parsed JSON.")            
         
         ## if we get a response 
@@ -1016,7 +1004,6 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
     global step_counter, exec_visual_state
     print("LLM Monitor: Started (Parallel Mode).")
 
-
     last_recovery = None
 
     # --- 1. SETUP MULTI-KEY ROTATION ---
@@ -1061,6 +1048,9 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
     stopped = False
     PRED_DIM = len(predicate_pool)
     predicate_to_idx = {p: i for i, p in enumerate(predicate_pool)}
+    
+    enforcer = LogicEnforcer(predicate_to_idx, "/home/olagh48652/task_monitor/test_rules/rules.yaml")
+    
     grasped_indices = [i for i, p in enumerate(predicate_pool) if p.strip().startswith("grasped(")]
     last_inferred_predicates = None
     last_trigger_time = 0
@@ -1139,8 +1129,7 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                 client_idx = (client_idx + 1) % len(clients)
 
                 print(f"--- Submitting Step {step_counter} to background (Key #{client_idx}) ---")
-                save_inference_images(step_counter, last_step.get("front_img"), last_step.get("wrist_img"), OUTPUT_FOLDER)
-
+                
                 # SUBMIT TO THREAD POOL
                 # We pass 'step_counter' so the result knows which step it belongs to
                 future = executor.submit(
@@ -1212,7 +1201,13 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                         with open(output_file, "w", encoding="utf-8") as f:
                             json.dump(r_json, f, indent=4)
 
-                        pred_vector = json_to_predicate_vector(r_json, predicate_to_idx, PRED_DIM)
+                        pred_vector_unenforced = json_to_predicate_vector(r_json, predicate_to_idx, PRED_DIM)
+                        
+                        print(f"BEFORE {pred_vector_unenforced}")
+                        pred_vector = enforcer.apply_rules(pred_vector_unenforced)
+                        
+                        print(f"AFTER {pred_vector}")
+                        
                         r_json = None
                         
                         pred_vector = np.append(pred_vector, r_grasped) 
@@ -1296,8 +1291,14 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                                     set_exec_visual_state(ExecVisualState.RECOVERING)
                                     print(f"Recovering to mode with reset position")
                                     cmd_pub_socket.send_pyobj({"command": "RESET_POSE"})
+                                    # time.sleep(2)
                                     wait_for_next_step("Recovering to reset pose — run perception?")
                                     print("RUNNING PERCEPTION")
+                                    
+                                    ## get current snapshot
+                                    cmd_pub_socket.send_pyobj({"command": "SNAPSHOT"})
+                                    
+                                    wait_for_next_step("Recovering to reset pose — run perception?")
                                     # to set the mode in the perception
                                     new_stat = trigger_perception_standalone(infer_mode=True)
                                     print(f"new_stat: {new_stat}")
@@ -1568,8 +1569,9 @@ def gui_backdoor_buttons(ltl_monitor):
             output_file = os.path.join(OUTPUT_FOLDER, f"{step_counter}_true_predicates.json")
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(json_output, f, indent=4)
-            save_inference_images(step_counter, last_step.get("front_img"), last_step.get("wrist_img"), OUTPUT_FOLDER)
-            step_counter += 1
+                
+            step_counter += 1  
+                  
             print("Successfully parsed JSON.")            
             
             ## if we get a response 

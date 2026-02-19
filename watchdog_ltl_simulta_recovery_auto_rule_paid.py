@@ -12,7 +12,7 @@ from collections import deque
 import google.genai as genai
 from dotenv import load_dotenv
 import os
-from formula_to_dict_recovery import LTLMonitor
+from formula_to_dict_recovery_rule import LTLMonitor
 from datetime import datetime
 
 from dataclasses import dataclass
@@ -20,6 +20,7 @@ from typing import Dict, Optional
 
 from enum import Enum
 
+from rule_enforcer import LogicEnforcer
 
 class ExecVisualState(Enum):
     RUNNING = "RUNNING"
@@ -79,7 +80,7 @@ def decide_recovery(
     last_recovery,
 ):  
     # last_recovery should be wiped every time the policy is run 
-    if retry_count < 2:
+    if retry_count < 1:
         return (RecoveryAction.RETRY_PERCEPTION, None)
     
     # Recovery already tried get-state-at-reset and we're still in violation → abort (no state satisfied)
@@ -126,6 +127,15 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 # --- CONFIG ---
 HISTORY_LEN = 3
 running = True # Global flag to control threads
+
+# --- SPEED / RELIABILITY NOTES ---
+# - Too slow / violations detected too late: (1) Lower TRIGGER_INTERVAL so inference runs more often.
+#   (2) Use a faster model (e.g. gemini-2.5-flash) for lower latency; trade-off is more false preds.
+# - Flash gives many false preds / violations only after catastrophe: (1) Prefer gemini-2.5-pro for
+#   accuracy when latency allows. (2) Keep HISTORY_LEN and initial_step so the model has temporal
+#   context. (3) Use perception_retry and recovery loop so one bad inference doesn't stop the task.
+# - To debug: check OUTPUT_FOLDER for {step_id}_front.jpg, {step_id}_wrist.jpg next to
+#   {step_id}_true_predicates.json to see exactly what the robot saw at each inference.
 
 # Step-through mode: when enabled, pause at recovery/continue points until "Next Step" is clicked in GUI
 step_mode_enabled = True   # If True, pause at step points; if False, run without pausing
@@ -553,10 +563,14 @@ def cv2_to_pil(cv_img):
 def save_inference_images(step_id, front_img, wrist_img, folder):
     """Save front and wrist images used for inference next to the predicate JSON (same step_id)."""
     try:
-        if front_img is not None and hasattr(front_img, "save"):
-            front_img.save(os.path.join(folder, f"{step_id}_front.jpg"), "JPEG", quality=92)
-        if wrist_img is not None and hasattr(wrist_img, "save"):
-            wrist_img.save(os.path.join(folder, f"{step_id}_wrist.jpg"), "JPEG", quality=92)
+        if front_img is not None:
+            path = os.path.join(folder, f"{step_id}_front.jpg")
+            if hasattr(front_img, "save"):
+                front_img.save(path, "JPEG", quality=92)
+        if wrist_img is not None:
+            path = os.path.join(folder, f"{step_id}_wrist.jpg")
+            if hasattr(wrist_img, "save"):
+                wrist_img.save(path, "JPEG", quality=92)
     except Exception as e:
         print(f"[save_inference_images] Error saving step {step_id}: {e}")
 
@@ -700,7 +714,7 @@ def data_receiver_thread(port=5540):
     """
     Continuously reads from ZMQ and updates the shared buffer.
     """
-    global shared_buffer, running, stopped, grasped, initial_step, pending_initial_snapshot
+    global shared_buffer, running, stopped, grasped, initial_step, pending_initial_snapshot, stop_buffer
     
     context = zmq.Context()
     socket = context.socket(zmq.SUB)
@@ -730,6 +744,7 @@ def data_receiver_thread(port=5540):
                 print(">>> Wiping History Buffer ...") #and Initial Step...")
                 with buffer_lock:
                     shared_buffer.clear()
+                    stop_buffer = False
                 # with initial_step_lock:
                 #     initial_step = None
                 #     pending_initial_snapshot = None
@@ -738,10 +753,15 @@ def data_receiver_thread(port=5540):
                 print(">>> Wiping History Buffer ...") #and Initial Step...")
                 with buffer_lock:
                     shared_buffer.clear()
+                    stop_buffer = False
                 # with initial_step_lock:
                 #     initial_step = None
                 #     pending_initial_snapshot = None
                 stopped = False
+                continue
+            
+            if 'event' in message and message['event'] == 'snapshot_sent':
+                print("*** RECIEVED SNAPSHOT ")
                 continue
             
             # 2. Process Images (Decode from Bytes)
@@ -1013,20 +1033,20 @@ import collections
 def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
     global shared_buffer, running, stopped, last_inferred_predicates, last_inference_time, vis_image_buffer
     global client, initial_step, pending_initial_snapshot
-    global step_counter, exec_visual_state
+    global step_counter, exec_visual_state, stop_buffer
     print("LLM Monitor: Started (Parallel Mode).")
-
 
     last_recovery = None
 
     # --- 1. SETUP MULTI-KEY ROTATION ---
     # Load all keys
     keys = [
-        os.environ.get("GEMINI_API_KEY_HASSAN"),
-        os.environ.get("GEMINI_API_KEY_NOUR"),
-        os.environ.get("GEMINI_API_KEY_LEEN"),
-        os.environ.get("GEMINI_API_KEY"),
-        os.environ.get("GEMINI_API_KEY_GMAIL"),
+        os.environ.get("GEMINI_API_KEY_CLOUD"),
+        # os.environ.get("GEMINI_API_KEY_HASSAN"),
+        # os.environ.get("GEMINI_API_KEY_NOUR"),
+        # os.environ.get("GEMINI_API_KEY_LEEN"),
+        # os.environ.get("GEMINI_API_KEY"),
+        # os.environ.get("GEMINI_API_KEY_GMAIL"),
     ]
     # Filter out None keys if environment vars are missing
     keys = [k for k in keys if k]
@@ -1061,15 +1081,18 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
     stopped = False
     PRED_DIM = len(predicate_pool)
     predicate_to_idx = {p: i for i, p in enumerate(predicate_pool)}
+    
+    enforcer = LogicEnforcer(predicate_to_idx, "/home/olagh48652/task_monitor/test_rules/rules.yaml")
+    
     grasped_indices = [i for i, p in enumerate(predicate_pool) if p.strip().startswith("grasped(")]
     last_inferred_predicates = None
     last_trigger_time = 0
-    TRIGGER_INTERVAL = 15.0  # Seconds between launching new inference requests
+    TRIGGER_INTERVAL = 20.0  # Seconds between launching new inference requests pro takes more time to avoid processing very old data
 
     keypoints = KeypointStore(reset_pose=np.zeros(7))
     violation_retry_count = 0
     grasp_recovery = 0
-
+    stop_buffer = False
     while running:
         if stopped:
             time.sleep(1)
@@ -1090,7 +1113,9 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                 if len(shared_buffer) > 0:
                     current_context_snapshot = list(shared_buffer)
                 else:
-                    print("shared buffer less than 1...")
+                    if not stop_buffer:
+                        print("shared buffer less than 1...")
+                        stop_buffer = True
             
             if current_context_snapshot:
                 last_trigger_time = current_time # Reset timer
@@ -1161,7 +1186,7 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
             else:
                 # Buffer empty, retry soon
                 time.sleep(0.1)
-                print("buffer empty retrying")
+                # print("buffer empty retrying")
 
         # ==========================================================
         # PHASE B: PROCESSING (Check strictly in order)
@@ -1212,7 +1237,13 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                         with open(output_file, "w", encoding="utf-8") as f:
                             json.dump(r_json, f, indent=4)
 
-                        pred_vector = json_to_predicate_vector(r_json, predicate_to_idx, PRED_DIM)
+                        pred_vector_unenforced = json_to_predicate_vector(r_json, predicate_to_idx, PRED_DIM)
+                        
+                        print(f"BEFORE {pred_vector_unenforced}")
+                        pred_vector = enforcer.apply_rules(pred_vector_unenforced)
+                        
+                        print(f"AFTER {pred_vector}")
+                        
                         r_json = None
                         
                         pred_vector = np.append(pred_vector, r_grasped) 
@@ -1296,8 +1327,14 @@ def llm_monitor_loop_sim(ltl_monitor, cmd_pub_socket):
                                     set_exec_visual_state(ExecVisualState.RECOVERING)
                                     print(f"Recovering to mode with reset position")
                                     cmd_pub_socket.send_pyobj({"command": "RESET_POSE"})
+                                    # time.sleep(2)
                                     wait_for_next_step("Recovering to reset pose — run perception?")
                                     print("RUNNING PERCEPTION")
+                                    
+                                    ## get current snapshot
+                                    cmd_pub_socket.send_pyobj({"command": "SNAPSHOT"})
+                                    
+                                    wait_for_next_step("Recovering to reset pose — run perception?")
                                     # to set the mode in the perception
                                     new_stat = trigger_perception_standalone(infer_mode=True)
                                     print(f"new_stat: {new_stat}")
@@ -1612,14 +1649,16 @@ def gui_backdoor_buttons(ltl_monitor):
 # ------------------------------------------------------------
 if __name__ == "__main__":
     global client, GEMINI_API_KEY, MODEL_ID
-    # api_keys_available = ["GEMINI_API_KEY", "GEMINI_API_KEY_LEEN", "GEMINI_API_KEY_NOUR", "GEMINI_API_KEY_HASSAN"]
 
-    # # MODEL_ID = "gemini-2.0-flash"
+    # MODEL_ID = "gemini-2.5-flash"
     # Gemini Robotics ER 1.5 Preview : gemini-robotics-er-1.5-preview
-    MODEL_ID = "gemini-2.5-flash"
+    MODEL_ID = "gemini-2.5-pro"
     # MODEL_ID = "gemini-robotics-er-1.5-preview"
-    GEMINI_API_KEY = os.environ["GEMINI_API_KEY_HASSAN"]
-    api_keys_used.append("GEMINI_API_KEY_HASSAN")
+    # GEMINI_API_KEY = os.environ["GEMINI_API_KEY_HASSAN"]
+    # api_keys_used.append("GEMINI_API_KEY_HASSAN")
+    
+    GEMINI_API_KEY = os.environ["GEMINI_API_KEY_CLOUD"]
+    api_keys_used.append("GEMINI_API_KEY_CLOUD")
     # api_keys_used.append("GEMINI_API_KEY_HASSAN")
     # api_keys_used.append("GEMINI_API_KEY_NOUR") ## already done
     client = genai.Client(api_key=GEMINI_API_KEY)
