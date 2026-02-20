@@ -92,6 +92,60 @@ class NetworkWatchdog:
         except Exception as e:
             print(f"Watchdog Send Error: {e}")
 
+    def send_state_at_stop(self, obs_dict):
+        """
+        Send current state when STOP received. Monitor uses this for recovery
+        inference so it has the exact scene at the moment of stop.
+        """
+        try:
+            payload = {
+                'q': obs_dict['joint_states'],
+                'ee_pos': obs_dict['ee_states'],
+                'gripper_state': obs_dict['gripper_states'],
+                'timestamp': time.time(),
+                'event': 'robot_stopped',
+            }
+            if 'agentview_rgb' in obs_dict:
+                img0 = obs_dict['agentview_rgb']
+                if img0.shape[0] == 3:
+                    img0 = img0.transpose(1, 2, 0)
+                payload['cam0_jpg'] = self.compress_image(img0)
+            if 'eye_in_hand_rgb' in obs_dict:
+                img1 = obs_dict['eye_in_hand_rgb']
+                if img1.shape[0] == 3:
+                    img1 = img1.transpose(1, 2, 0)
+                payload['cam1_jpg'] = self.compress_image(img1)
+            self.pub_socket.send_pyobj(payload)
+        except Exception as e:
+            print(f"Watchdog Send Error (state_at_stop): {e}")
+
+    def send_batch_done(self, obs_dict):
+        """
+        Signal that policy has completed a batch of 2-3 rolls.
+        Sends current state + batch_done event so monitor runs inference.
+        """
+        try:
+            payload = {
+                'q': obs_dict['joint_states'],
+                'ee_pos': obs_dict['ee_states'],
+                'gripper_state': obs_dict['gripper_states'],
+                'timestamp': time.time(),
+                'event': 'batch_done',
+            }
+            if 'agentview_rgb' in obs_dict:
+                img0 = obs_dict['agentview_rgb']
+                if img0.shape[0] == 3:
+                    img0 = img0.transpose(1, 2, 0)
+                payload['cam0_jpg'] = self.compress_image(img0)
+            if 'eye_in_hand_rgb' in obs_dict:
+                img1 = obs_dict['eye_in_hand_rgb']
+                if img1.shape[0] == 3:
+                    img1 = img1.transpose(1, 2, 0)
+                payload['cam1_jpg'] = self.compress_image(img1)
+            self.pub_socket.send_pyobj(payload)
+        except Exception as e:
+            print(f"Watchdog Send Error (batch_done): {e}")
+
     def send_state(self, obs_dict):
         """Non-blocking send of current state"""
         try:
@@ -243,6 +297,11 @@ class DiffusionPolicyInference():
         self.shutdown_event = threading.Event()
         self.rollout_active = threading.Event()
         self.command_lock = threading.Lock()
+        self.inference_proceed_event = threading.Event()  # Set when PROCEED received from monitor
+
+        # Step-sync: max policy rolls per batch before waiting for inference
+        self.rolls_per_batch = 2  # 2 or 3 to avoid policy running too far ahead
+        self.inference_wait_timeout = 60.0  # Max seconds to wait for inference result Test with 60s
 
         self.supervisor_thread = threading.Thread(
             target=self.supervisor_listener,
@@ -461,6 +520,10 @@ class DiffusionPolicyInference():
             print("Supervisor STOP received")
             self.stop_inf = True
             self.in_recovery = True
+            # Send current obs so monitor has state-at-stop for correct recovery inference
+            self._sync_log("sending state-at-stop to monitor")
+            obs_at_stop = self.get_current_obs()
+            self.watchdog.send_state_at_stop(obs_at_stop)
 
         elif cmd == "RESET_POSE":
             print("Supervisor RESET_POSE received")
@@ -501,6 +564,12 @@ class DiffusionPolicyInference():
                 print("Supervisor CONTINUE received")
                 self.continue_after_recovery()
 
+        elif cmd == "PROCEED":
+            # Inference done, no violation; robot can continue next batch of rolls
+            t = time.strftime("%H:%M:%S")
+            print(f"[ROBOT {t}] PROCEED received → releasing wait")
+            self.inference_proceed_event.set()
+
         elif cmd == "TASK_DONE":
             print("Supervisor TASK_DONE received")
             self.stop_inf = True
@@ -529,54 +598,94 @@ class DiffusionPolicyInference():
         return moving
 
 
+    def _sync_log(self, msg):
+        """Timestamped log for step-sync tracing."""
+        t = time.strftime("%H:%M:%S")
+        print(f"[ROBOT {t}] {msg}")
+
     def rollout_policy(self, n_obs_steps=2):
-        # imgs = []
-        print("Starting Policy Rollout...")
+        """
+        Step-synchronized rollout: policy runs 2–3 rolls, sends data, waits for
+        inference (up to 10s), then continues. Avoids policy running too far
+        ahead and doing irreversible actions before late detection.
+        """
+        self._sync_log("rollout START (step-sync: %d rolls/batch, %.1fs wait)" % (
+            self.rolls_per_batch, self.inference_wait_timeout))
         self.stop_inf = False
 
         framestacker = FrameStackForTrans(n_obs_steps)
         self.obs_dict = self.get_current_obs()
         self.obs_dict = framestacker.reset(self.obs_dict)
         step = 0
-        
-        
+        batch_id = 0
+
         while not self.stop_inf and step < self.max_steps:
-            
+
             if len(self.robot_interface._state_buffer) == 0:
                 continue
-            
-            self.obs_dict=self.get_current_obs()
 
-            # 1. Check if Monitor sent "STOP" recently
-            if self.stop_inf:
-                break
-    
-            # 2. Send current state to Monitor (Fire and Forget)
-            if self.is_robot_moving():
-                print("moving")
-                self.watchdog.send_state(self.obs_dict)
+            batch_id += 1
+            self._sync_log("batch %d START (step=%d)" % (batch_id, step))
 
-            # self.watchdog.send_state(self.obs_dict)
-            
-            obs = framestacker.add_new_obs(self.obs_dict)
-            action_pred = self.predict_action(obs)
-            # print(action_pred)
-            # print(f'actions: {action[0]:.3f} {action[1]:.3f} {action[2]:.3f} {action[-1]:.3f}')
-            
-            for action in action_pred[:4]:
+            # --- BATCH: do at most rolls_per_batch policy steps ---
+            rolls_this_batch = 0
+            while rolls_this_batch < self.rolls_per_batch and not self.stop_inf and step < self.max_steps:
+
+                if len(self.robot_interface._state_buffer) == 0:
+                    continue
+
+                self.obs_dict = self.get_current_obs()
                 if self.stop_inf:
                     break
 
-                self.robot_interface.control(
-                    controller_type=self.controller_type,
-                    action=action,
-                    controller_cfg=self.controller_cfg,
-                )
+                # Send state to monitor (every step)
+                self.watchdog.send_state(self.obs_dict)
 
-            step = step + 1
+                obs = framestacker.add_new_obs(self.obs_dict)
+                action_pred = self.predict_action(obs)
+
+                for action in action_pred[:4]:
+                    if self.stop_inf:
+                        break
+                    self.robot_interface.control(
+                        controller_type=self.controller_type,
+                        action=action,
+                        controller_cfg=self.controller_cfg,
+                    )
+
+                step += 1
+                rolls_this_batch += 1
+                self._sync_log("batch %d roll %d/%d done (step=%d)" % (batch_id, rolls_this_batch, self.rolls_per_batch, step))
+                # ## 8 secs between steps
+                # time.sleep(8)
+                
+
+            if self.stop_inf:
+                break
+
+            # --- After batch: send batch_done and wait for inference ---
+            self.obs_dict = self.get_current_obs()
+            self.watchdog.send_batch_done(self.obs_dict)
+            self._sync_log("batch %d SENT batch_done (step=%d) → waiting for PROCEED/STOP (max %.1fs)" % (
+                batch_id, step, self.inference_wait_timeout))
+
+            self.inference_proceed_event.clear()
+            wait_start = time.time()
+            while time.time() - wait_start < self.inference_wait_timeout:
+                if self.stop_inf:
+                    self._sync_log("batch %d STOP received while waiting → recovery" % batch_id)
+                    break
+                if self.inference_proceed_event.wait(timeout=0.1):
+                    elapsed = time.time() - wait_start
+                    self._sync_log("batch %d PROCEED received (waited %.2fs) → next batch" % (batch_id, elapsed))
+                    break
+            else:
+                if not self.stop_inf:
+                    self._sync_log("batch %d TIMEOUT (%.1fs) no PROCEED → continuing (DESYNC RISK)" % (
+                        batch_id, self.inference_wait_timeout))
 
         if self.stop_inf:
-            print("Rollout stopped → entering recovery mode")
+            self._sync_log("rollout STOPPED → recovery mode")
             self.in_recovery = True
             
             
