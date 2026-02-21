@@ -321,6 +321,7 @@ class LTLMonitor:
         for mode, transitions in self.automaton_dict.items():
             for pattern in transitions.keys():
                 if self._match_pattern(sensor_vec, pattern):
+                    print(f"matched {sensor_vec} and {pattern}")
                     return mode
         return None
        

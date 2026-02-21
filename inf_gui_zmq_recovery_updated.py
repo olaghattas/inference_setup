@@ -146,33 +146,32 @@ class NetworkWatchdog:
         except Exception as e:
             print(f"Watchdog Send Error (batch_done): {e}")
 
+    def _build_state_payload(self, obs_dict, event=None):
+        """Build state payload dict (q, ee_pos, gripper_state, images). Optionally set event."""
+        payload = {
+            'q': obs_dict['joint_states'],
+            'ee_pos': obs_dict['ee_states'],
+            'gripper_state': obs_dict['gripper_states'],
+            'timestamp': time.time()
+        }
+        if event is not None:
+            payload['event'] = event
+        if 'agentview_rgb' in obs_dict:
+            img0 = obs_dict['agentview_rgb']
+            if img0.shape[0] == 3:
+                img0 = img0.transpose(1, 2, 0)
+            payload['cam0_jpg'] = self.compress_image(img0)
+        if 'eye_in_hand_rgb' in obs_dict:
+            img1 = obs_dict['eye_in_hand_rgb']
+            if img1.shape[0] == 3:
+                img1 = img1.transpose(1, 2, 0)
+            payload['cam1_jpg'] = self.compress_image(img1)
+        return payload
+
     def send_state(self, obs_dict):
         """Non-blocking send of current state"""
         try:
-            # Prepare payload
-            # print("obs_dict: ", obs_dict)
-            payload = {
-                'q': obs_dict['joint_states'],
-                'ee_pos': obs_dict['ee_states'],
-                'gripper_state': obs_dict['gripper_states'],
-                'timestamp': time.time()
-            }
-
-            # Compress Images
-            if 'agentview_rgb' in obs_dict:
-                img0 = obs_dict['agentview_rgb']
-                if img0.shape[0] == 3: img0 = img0.transpose(1, 2, 0)
-                payload['cam0_jpg'] = self.compress_image(img0)
-
-            if 'eye_in_hand_rgb' in obs_dict:
-                img1 = obs_dict['eye_in_hand_rgb']
-                if img1.shape[0] == 3: img1 = img1.transpose(1, 2, 0)
-                payload['cam1_jpg'] = self.compress_image(img1)
-
-
-            # Send immediately (Fire and Forget)
-            self.pub_socket.send_pyobj(payload)
-
+            self.pub_socket.send_pyobj(self._build_state_payload(obs_dict))
         except Exception as e:
             print(f"Watchdog Send Error: {e}")
 
@@ -300,7 +299,7 @@ class DiffusionPolicyInference():
         self.inference_proceed_event = threading.Event()  # Set when PROCEED received from monitor
 
         # Step-sync: max policy rolls per batch before waiting for inference
-        self.rolls_per_batch = 2  # 2 or 3 to avoid policy running too far ahead
+        self.rolls_per_batch = 5  # 2 or 3 to avoid policy running too far ahead
         self.inference_wait_timeout = 60.0  # Max seconds to wait for inference result Test with 60s
 
         self.supervisor_thread = threading.Thread(
@@ -545,16 +544,9 @@ class DiffusionPolicyInference():
         
         elif cmd == "SNAPSHOT":
             print("Supervisor SNAPSHOT received")
-            self.obs_dict=self.get_current_obs()
-            # 2. Send current state to Monitor (Fire and Forget)
-            self.watchdog.send_state(self.obs_dict)
-
-            payload = {
-                'event': 'snapshot_sent',
-                'timestamp': time.time()
-            }
-
-            # Send immediately (Fire and Forget)
+            self.obs_dict = self.get_current_obs()
+            # Send snapshot as SINGLE message (CONFLATE would drop a 2nd message)
+            payload = self.watchdog._build_state_payload(self.obs_dict, event='snapshot_sent')
             self.watchdog.pub_socket.send_pyobj(payload)
             
        
