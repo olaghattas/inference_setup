@@ -36,50 +36,9 @@ from deoxys.experimental.motion_utils import follow_joint_traj, reset_joints_to
 from deoxys_vision.networking.camera_redis_interface import CameraRedisSubInterface
 from deoxys_vision.utils.camera_utils import assert_camera_ref_convention, get_camera_info
 
-this require 5555
- Address already in use (addr='tcp://*:5555')
-
-spacemouse = SpaceMouse(vendor_id=9583, product_id=50734)
-spacemouse.start_control()
-
-threshold = 0.00001  # tune based on your device noise
-
-def has_spacemouse_input(action_vector):
-    last_ok = action_vector[-1] != -1.
-    movement = any(abs(x) > threshold for x in action_vector[:5])
-    return last_ok or movement
-
-obs = framestacker.add_new_obs(obs_dict)
-action_pred=predict_action(obs)
-# print(action_pred)
-# print(f'actions: {action[0]:.3f} {action[1]:.3f} {action[2]:.3f} {action[-1]:.3f}')
-start = time.perf_counter()
-for action in action_pred[:4]: 
-
-    action_sm, grasp_sm = input2action(
-    device=spacemouse,
-    controller_type=controller_type,
-)
-end = time.perf_counter()
-
-duration = end - start
-print(f"Time taken: {duration:.6f} seconds")
-
-if action_sm is not None and has_spacemouse_input(action_sm):
-    print("action_sm", action_sm)
-    print("################# SPACEMOUSE ##################")
-    robot_interface.control(
-    controller_type=controller_type,
-    action=action_sm,
-    controller_cfg=controller_cfg,
-)
-else:  
-    print("################# POLICY ##################")
-    robot_interface.control(
-        controller_type=controller_type,
-        action=action,
-        controller_cfg=controller_cfg,
-    )
+SPACEMOUSE_ZMQ_PORT = 5555  # SpaceMouse backend uses this TCP port (must be free)
+SPACEMOUSE_VENDOR_ID = 9583
+SPACEMOUSE_PRODUCT_ID = 50734
 
 
 # --- ASYNCHRONOUS NETWORK WATCHDOG ---
@@ -353,6 +312,91 @@ class DiffusionPolicyInference():
         )
         self.supervisor_thread.start()
 
+        # -------------------------
+        # SpaceMouse override setup
+        # -------------------------
+        # When SpaceMouse moves, override policy actions for that control tick.
+        # If SpaceMouse init fails (often because tcp://*:5555 is occupied), we disable override.
+        self.spacemouse_override_enabled = True
+        self.spacemouse_override_threshold = 1e-5
+        self.spacemouse_override_timeout_s = 0.25
+        self._spacemouse_last_active_ts = 0.0
+        self.spacemouse = None
+
+        try:
+            self._init_spacemouse()
+            print("[SpaceMouse] Override ENABLED")
+        except Exception as e:
+            self.spacemouse_override_enabled = False
+            self.spacemouse = None
+            print(f"[SpaceMouse] Override DISABLED: {e}")
+
+    def _assert_spacemouse_port_free(self):
+        """
+        Best-effort check that tcp://*:{SPACEMOUSE_ZMQ_PORT} is free.
+        SpaceMouse backend binds this port; if something else occupies it, SpaceMouse init will fail.
+        """
+        ctx = zmq.Context()
+        s = ctx.socket(zmq.REP)
+        try:
+            s.bind(f"tcp://*:{SPACEMOUSE_ZMQ_PORT}")
+        finally:
+            try:
+                s.close(0)
+            except Exception:
+                pass
+            try:
+                ctx.term()
+            except Exception:
+                pass
+
+    def _init_spacemouse(self):
+        self._assert_spacemouse_port_free()
+        self.spacemouse = SpaceMouse(
+            vendor_id=SPACEMOUSE_VENDOR_ID,
+            product_id=SPACEMOUSE_PRODUCT_ID,
+        )
+        self.spacemouse.start_control()
+
+    def _has_spacemouse_input(self, action_vector):
+        """
+        action_vector: output of input2action(). Treat any meaningful movement or valid gripper cmd as override.
+        """
+        if action_vector is None:
+            return False
+        try:
+            last_ok = float(action_vector[-1]) != -1.0
+        except Exception:
+            last_ok = False
+        try:
+            movement = any(abs(float(x)) > self.spacemouse_override_threshold for x in action_vector[:6])
+        except Exception:
+            movement = False
+        active = last_ok or movement
+        if active:
+            self._spacemouse_last_active_ts = time.time()
+        return active
+
+    def _read_spacemouse_action(self):
+        """
+        Returns:
+          np.ndarray action | None
+        """
+        if not self.spacemouse_override_enabled or self.spacemouse is None:
+            return None
+        action_sm, _grasp_sm = input2action(
+            device=self.spacemouse,
+            controller_type=self.controller_type,
+        )
+        if action_sm is None:
+            return None
+        if self._has_spacemouse_input(action_sm):
+            return action_sm
+        # Small grace period: if recently active, keep suppressing policy to avoid flicker
+        if (time.time() - self._spacemouse_last_active_ts) <= self.spacemouse_override_timeout_s:
+            return action_sm
+        return None
+
 
     def supervisor_listener(self):
         print("Supervisor listener started")
@@ -506,6 +550,13 @@ class DiffusionPolicyInference():
 
     def close_robot_interface(self):
         self.robot_interface.close()
+        try:
+            if self.spacemouse is not None:
+                # SpaceMouse class doesn't always expose a clean stop; best-effort.
+                if hasattr(self.spacemouse, "stop_control"):
+                    self.spacemouse.stop_control()
+        except Exception:
+            pass
         
     def stop_inf_func(self):
         self.stop_inf = True
@@ -684,11 +735,19 @@ class DiffusionPolicyInference():
                 for action in action_pred[:4]:
                     if self.stop_inf:
                         break
-                    self.robot_interface.control(
-                        controller_type=self.controller_type,
-                        action=action,
-                        controller_cfg=self.controller_cfg,
-                    )
+                    action_sm = self._read_spacemouse_action()
+                    if action_sm is not None:
+                        self.robot_interface.control(
+                            controller_type=self.controller_type,
+                            action=action_sm,
+                            controller_cfg=self.controller_cfg,
+                        )
+                    else:
+                        self.robot_interface.control(
+                            controller_type=self.controller_type,
+                            action=action,
+                            controller_cfg=self.controller_cfg,
+                        )
 
                 step += 1
                 rolls_this_batch += 1
